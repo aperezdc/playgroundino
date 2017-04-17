@@ -664,6 +664,9 @@ local Rule = Object:clone {
    end;
 
    source_matches = function (self, filename)
+      if not self.sources then
+         return false
+      end
       if not self.__source_match_patterns then
          self.__source_match_patterns = map(self.sources, function (stem_pattern)
             return globtopattern(string.gsub(stem_pattern, "%%", "*"))
@@ -985,6 +988,29 @@ end
 
 -- Always set a "builddir" variable.
 vars:append(Variable:new("builddir", OPTIONS.builddir or "build"))
+
+-- Add a rule to regenerate the Ninja build file.
+do local args = List:new()
+   for i = 1, select("#", ...) do
+      args:append(select(i, ...))
+   end
+   vars:append(Variable:new("-configure-arguments", args:concat(" ")))
+
+   local r = Rule:new("-configure", {
+      description = "RECONFIGURE ${-configure-arguments}";
+      command = "./configure ${-configure-arguments}";
+      generator = 1;
+   })
+   rules[r.name] = r
+
+   local b = Build:new(r, {
+      source = "Build";
+      target = "build.ninja";
+      extra_source = "configure";
+      pool = "console";
+   })
+   build:append(b)
+end
 
 local rr = load_build("Build")
 
