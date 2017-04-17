@@ -1,0 +1,6 @@
+#! /bin/sh
+if [[ $# -ne 1 ]] ; then
+	echo "Usage: $0 file.hex" 1&>2
+	exit 1
+fi
+exec avrdude -c arduino -p m328p -P /dev/ttyUSB0 "-Uflash:w:${1}:i"
