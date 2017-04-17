@@ -130,7 +130,7 @@ libarduino = build.lib "arduino" {
 
 function sketch(name)
    return function (sources)
-      local elf = build.elf (name) { libarduino, sources }
+      local elf = build.elf (name) { sources, libarduino }
       local hex = build.hex (name) { elf }
       local eep = build.eep (name) { elf }
       return hex, eep, elf
