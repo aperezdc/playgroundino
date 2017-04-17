@@ -1,0 +1,996 @@
+#! /usr/bin/env lua
+-- vim:set ts=3 sw=3 et:
+--
+-- bgen
+-- Copyright (C) 2017 Adrian Perez <aperez@igalia.com>
+--
+-- Distributed under terms of the MIT license.
+--
+
+
+local debug = os.getenv("BGEN_DEBUG") ~= nil
+local dprint = debug and function (fmt, ...)
+   io.stderr:write(fmt:format(...))
+end or function (fmt, ...) end
+
+
+------------------------------------------------- Command line parsing ------
+--
+local OPTIONS = {}
+
+do
+   local usage = [[
+Usage: bgen [option...]
+
+Options:
+  <name>          Set the boolean flag <name>.
+  <name>=<value>  Define a variable <name> with a <value>.
+
+Some variables affect the behaviour of the generated build files:
+  builddir        Directory used as output for built files [default: "build"].
+]]
+
+   local cli_var_pattern = "^([%a%-_][%w%-_]*)=(.*)$"
+   local cli_bool_pattern = "^[%a%-_][%w%-_]*$"
+   local function parse_cli_options(...)
+      local options = {}
+      for i = 1, select("#", ...) do
+         local opt = select(i, ...)
+         local name, value = opt:match(cli_var_pattern)
+         if name and value then
+            dprint("flag: %s = %q\n", name, value)
+            options[name] = value
+         elseif opt:match(cli_bool_pattern) then
+            dprint("flag: %s\n", opt)
+            options[opt] = true
+         else
+            return false, "Invalid option name: '" .. opt .. "'\n" .. usage
+         end
+      end
+      return options
+   end
+
+   local opts, err = parse_cli_options(...)
+   if not opts then
+      io.stderr:write(err, "\n")
+      os.exit(3)
+   end
+
+   OPTIONS = opts
+end
+
+--
+-- Source:
+-- https://github.com/davidm/lua-glob-pattern/blob/master/lua/globtopattern.lua
+--
+local function globtopattern(g)
+   -- Some useful references:
+   -- - apr_fnmatch in Apache APR.  For example,
+   --   http://apr.apache.org/docs/apr/1.3/group__apr__fnmatch.html
+   --   which cites POSIX 1003.2-1992, section B.6.
+
+   local p = "^"  -- pattern being built
+   local i = 0    -- index in g
+   local c        -- char at index i in g.
+
+   -- unescape glob char
+   local function unescape()
+      if c == '\\' then
+         i = i + 1; c = g:sub(i,i)
+         if c == '' then
+            p = '[^]'
+            return false
+         end
+      end
+      return true
+   end
+
+   -- escape pattern char
+   local function escape(c)
+      return c:match("^%w$") and c or '%' .. c
+   end
+
+   -- Convert tokens at end of charset.
+   local function charset_end()
+      while 1 do
+         if c == '' then
+            p = '[^]'
+            return false
+         elseif c == ']' then
+            p = p .. ']'
+            break
+         else
+            if not unescape() then break end
+            local c1 = c
+            i = i + 1; c = g:sub(i,i)
+            if c == '' then
+               p = '[^]'
+               return false
+            elseif c == '-' then
+               i = i + 1; c = g:sub(i,i)
+               if c == '' then
+                  p = '[^]'
+                  return false
+               elseif c == ']' then
+                  p = p .. escape(c1) .. '%-]'
+                  break
+               else
+                  if not unescape() then break end
+                  p = p .. escape(c1) .. '-' .. escape(c)
+               end
+            elseif c == ']' then
+               p = p .. escape(c1) .. ']'
+               break
+            else
+               p = p .. escape(c1)
+               i = i - 1 -- put back
+            end
+         end
+         i = i + 1; c = g:sub(i,i)
+      end
+      return true
+   end
+
+   -- Convert tokens in charset.
+   local function charset()
+      i = i + 1; c = g:sub(i,i)
+      if c == '' or c == ']' then
+         p = '[^]'
+         return false
+      elseif c == '^' or c == '!' then
+         i = i + 1; c = g:sub(i,i)
+         if c == ']' then
+            -- ignored
+         else
+            p = p .. '[^'
+            if not charset_end() then return false end
+         end
+      else
+         p = p .. '['
+         if not charset_end() then return false end
+      end
+      return true
+   end
+
+   -- Convert tokens.
+   while 1 do
+      i = i + 1; c = g:sub(i,i)
+      if c == '' then
+         p = p .. '$'
+         break
+      elseif c == '?' then
+         p = p .. '.'
+      elseif c == '*' then
+         p = p .. '.*'
+      elseif c == '[' then
+         if not charset() then break end
+      elseif c == '\\' then
+         i = i + 1; c = g:sub(i,i)
+         if c == '' then
+            p = p .. '\\$'
+            break
+         end
+         p = p .. escape(c)
+      else
+         p = p .. escape(c)
+      end
+   end
+   return p
+end
+
+
+local ok, lfs = pcall(require, "lfs")
+if not ok then lfs = nil end
+local ls_dir, dir_sep = nil, package.config:match("[^\n]+")
+
+if lfs then
+   ls_dir = function (path)
+      return coroutine.wrap(function ()
+         for file in lfs.dir(path) do
+            if file ~= "." and file ~= ".." then
+               local attr = lfs.attributes(path .. dir_sep .. file)
+               if attr then
+                  coroutine.yield(file, attr.mode)
+               end
+            end
+         end
+      end)
+   end
+else
+   -- Maps file kinds as returned by the "stat" command into the
+   -- values returned by "lfs.attributes(path).mode"
+   local stat_map = {
+      ["fifo"] = "named pipe",
+      ["socket"] = "socket",
+      ["directory"] = "directory",
+      ["regular file"] = "file",
+      ["symbolic link"] = "link",
+      ["block special file"] = "block device",
+      ["character special file"] = "char device",
+   }
+   ls_dir = function (path)
+      -- Wrap the path in single quotes to avoid shell expansion,
+      -- and escape single quotes to avoid the shell interpreting
+      -- them as (premature) end of the string.
+      local path_wrapped = "'" .. (path:gsub("'", "'\\''")) .. "'"
+      return coroutine.wrap(function ()
+         local pipe = io.popen("ls -Aq1 " .. path_wrapped)
+         for line in pipe:lines() do
+            local fullpath = path .. dir_sep .. line
+            local statpipe = io.popen("stat --format=%F " ..
+            "'" .. (fullpath:gsub("'", "'\\''")) .. "'")
+            local stat = statpipe:read("*l")
+            statpipe:close()
+            coroutine.yield(line, stat_map[stat] or "other")
+         end
+         pipe:close()
+      end)
+   end
+end
+
+local fs = {}
+
+--
+-- Returns the extension of a file, or "nil" of no extension is found.
+--
+do local suffix_pattern = "%.([^%.]+)$"
+   function fs.ext(path)
+      return (path:match(suffix_pattern))
+   end
+end
+
+--
+-- Returns the "stem" of a file; that is the file name without the extension.
+--
+do local stem_pattern = "^(.-)%.[^%.]+$"
+   function fs.stem(path)
+      return (path:match(base_pattern)) or path
+   end
+end
+
+--
+-- Return the parent directory of a path.
+--
+do local dirname_pattern = "^(.-)" .. dir_sep .. "+[^" .. dir_sep .. "]+$"
+   function fs.dirname(path)
+      return (path:match(dirname_pattern))
+   end
+end
+
+--
+-- Return the name of a file in the same directory as "path".
+--
+do local dirname = fs.dirname
+   function fs.sibling(path, sibling, ...)
+      local dir = dirname(path)
+      if not dir then
+         return sibling
+      end
+      assert(type(sibling) == "string")
+      path = dir .. dir_sep .. sibling
+      for i = 1, select("#", ...) do
+         path = path .. dir_sep .. select(i, ...)
+      end
+      return path
+   end
+end
+
+--
+-- Constructs a child file name starting at "path".
+--
+do
+   function fs.child(path, ...)
+      for i = 1, select("#", ...) do
+         path = path .. dir_sep .. select(i, ...)
+      end
+      return path
+   end
+end
+
+
+--
+-- Based on Rici Lake's simple string interpolation
+-- See: http://lua-users.org/wiki/StringInterpolation
+--
+local concat_pattern = "^([^:]+):(.*)$"
+local dotted_path_pattern = "[^%.]+"
+local function interpolate(text, value)
+   return (string.gsub(text, "(%%%b{})", function (dotted_path)
+      local value = value
+      local concat_str = nil
+      for component in string.gmatch(string.sub(dotted_path, 3, -2), dotted_path_pattern) do
+         if type(value) ~= "table" then
+            value = dotted_path
+            break
+         end
+
+         local component_name
+         component_name, concat_str = string.match(component, concat_pattern)
+         if component_name and concat_str then
+            component = component_name
+         else
+            concat_str = nil
+         end
+
+         if type(value[component]) == "function" then
+            -- Pass the current value as "self"
+            value = value[component](value)
+         else
+            value = value[component]
+         end
+      end
+      if type(value) == "table" and concat_str then
+         -- Flatten a list
+         return table.concat(value, concat_str)
+      else
+         return tostring(value)
+      end
+   end))
+end
+
+local function template(text)
+   return function (vars)
+      return interpolate(text, vars)
+   end
+end
+
+--
+-- Functional utilities.
+--
+local function map(list, func)
+   local r = {}
+   for i, item in ipairs(list) do
+      r[i] = func(item)
+   end
+   return r
+end
+
+
+local Object = {}
+setmetatable(Object, Object)
+
+function Object:clone(t)
+   t = t or {}
+   t.__index = self
+   return setmetatable(t, t)
+end
+
+function Object:new(...)
+   local o = self:clone()
+   local init = o.__init
+   if type(init) == "function" then
+      init(o, ...)
+   end
+   return o
+end
+
+function Object:transmute(t)
+   assert(type(t) == "table")
+   assert(t.__index == nil)
+   assert(getmetatable(t) == nil)
+   t.__index = self
+   return setmetatable(t, t)
+end
+
+function Object:prototype()
+   local mt = getmetatable(self)
+   return mt and mt.__index
+end
+
+do -- Tests for Object.
+   local obj = Object:clone()
+   assert(obj ~= Object)
+   assert(obj:prototype() == Object)
+   assert(Object:new():prototype() == Object)
+   local Base = Object:clone()
+   function Base:foo() end
+   function Base:bar() end
+   assert(Base:new().foo == Base.foo)
+   assert(Base:new().bar == Base.bar)
+   obj = Base:new()
+   assert(obj:prototype().foo == obj.foo)
+   assert(obj:prototype().bar == obj.bar)
+   local Derived = Base:clone { foo = function () end }
+   assert(Derived:new().foo == Derived.foo)
+   assert(Derived:new().bar == Base.bar)
+   obj = Derived:new()
+   assert(obj:prototype().foo == obj.foo)
+   assert(obj:prototype():prototype().bar == obj.bar)
+end
+
+
+local List = Object:clone {
+   __init = function (self)
+      self.n = 0
+   end;
+   append = function (self, item)
+      self.n = self.n + 1
+      self[self.n] = item
+   end;
+   pop_left = function (self)
+      assert(self.n > 0)
+      return self:remove(1)
+   end;
+   pop_right = function (self)
+      assert(self.n > 0)
+      return self:remove(self.n)
+   end;
+   insert = table.insert;
+   concat = table.concat;
+   remove = table.remove;
+   ipairs = ipairs;
+}
+
+
+local Set = Object:clone {
+   __init = function (self, ...)
+      self._items = {}
+      self.n = 0
+      for i = 1, select("#", ...) do
+         self:add(select(i, ...))
+      end
+   end;
+   contains = function (self, item)
+      return self._items[item] == true
+   end;
+   add = function (self, item)
+      if self._items[item] ~= true then
+         self._items[item] = true
+         self.n = self.n + 1
+      end
+   end;
+   remove = function (self, item)
+      if self._items[item] == true then
+         self._items[item] = nil
+         self.n = self.n - 1
+      end
+   end;
+   items = function (self)
+      return coroutine.wrap(function ()
+         for k, _ in pairs(self._items) do
+            coroutine.yield(k)
+         end
+      end)
+   end;
+   concat = function (self, str)
+      return table.concat(self:as_table(), str)
+   end;
+   any = function (self)
+      assert(self.n > 0)
+      for k, _ in pairs(self._items) do
+         return k
+      end
+   end;
+   copy = function (self)
+      local new_set = self:prototype():new()
+      for item, _ in pairs(self._items) do
+         new_set:add(item)
+      end
+      return new_set
+   end;
+   as_table = function (self)
+      local n, t = 0, {}
+      for k, _ in pairs(self._items) do
+         n = n + 1
+         t[n] = k
+      end
+      return t
+   end;
+}
+
+
+local function list_or(list, item, default)
+   if list and list[1] then
+      return list
+   end
+   if item then
+      return { item }
+   end
+   return default
+end
+
+
+local Build = Object:clone {
+   render_targets           = template "build %{targets: }";
+   render_secondary_targets = template " | %{secondary_targets: }";
+   render_rule              = template " : %{rule} $\n  %{sources: $\n  }";
+   render_extra_sources     = template " | %{extra_sources: }";
+   render_order_deps        = template " || %{order_deps: }";
+   render_var               = template "  %{name} = %{value}\n";
+   render_repr              = template "<build %{rule} [%{targets:, }] %{sources: } {%{vars:, }}>";
+   render_repr_var          = template "%{name}: '%{value}'";
+
+   __init = function (self, rule, param)
+      self.rule = type(rule) == "string" and rule or rule.name
+      self.vars = list_or(param.vars, nil, {})
+      self.targets = list_or(param.targets, param.target, {})
+      self.sources = list_or(param.sources, param.source, {})
+      self.order_deps = list_or(param.order_deps, param.order_dep)
+      self.extra_sources = list_or(param.extra_sources, param.extra_source)
+      self.secondary_targets = list_or(param.secondary_targets, param.secondary_target)
+   end;
+
+   __repr = function (self)
+      local vars = List:new()
+      for key, value in pairs(self.vars) do
+         vars:append(self.render_repr_var { name = key, value = value })
+      end
+      return self.render_repr {
+         targets = self.targets;
+         sources = self.sources;
+         rule = self.rule;
+         vars = vars;
+      }
+   end;
+
+   add_vars = function (self, vars)
+      for name, value in pairs(vars) do
+         if type(name) == "string" then
+            if name:sub(1, 1) ~= "_" and name ~= "n" then
+               if not self.vars[name] then
+                  self.vars[name] = "${" .. name .. "}"
+               end
+               self.vars[name] = self.vars[name] .. " " .. value
+               dprint("VARAdd %s: %s\n", name, self.vars[name])
+            end
+         end
+      end
+   end;
+
+   write = function (self, f)
+      f:write(self:render_targets())
+      if self.secondary_targets then
+         f:write(self:render_secondary_targets())
+      end
+      f:write(self:render_rule())
+      if self.extra_sources then
+         f:write(self:render_extra_sources())
+      end
+      f:write("\n")
+      for k, v in pairs(self.vars) do
+         f:write(self.render_var { name = k, value = v })
+      end
+      f:write("\n")
+   end;
+}
+
+
+local rules = {}
+
+local function resolve_rules_aux(t_rule, pending_rules, source)
+   for rule in pending_rules:items() do
+      if rule:source_matches(source) then
+         local target = "${builddir}" .. dir_sep .. rule:_targets_for(source)[1]
+         -- dprint("(??) %s : %s %s\n", target, rule.name, source)
+         if t_rule:source_matches(target) then
+            -- dprint("  --> OK\n")
+            local build_chain = List:new()
+            build_chain:append(Build:new(rule, {
+               source = source;
+               target = target;
+            }))
+            return true, target, build_chain
+         end
+         local p = pending_rules:copy()
+         p:remove(rule)
+         local ok, n_target, build_chain = resolve_rules_aux(t_rule, p, target)
+         -- dprint("ok: %s, build_chain: %s\n", ok, build_chain)
+         if ok then
+            build_chain:append(Build:new(rule, {
+               source = source;
+               target = target;
+            }))
+            return true, n_target, build_chain
+         end
+      end
+   end
+   return false
+end
+
+local function resolve_rules(target_rule, source)
+   local pending_rules = Set:new()
+   for _, rule in pairs(rules) do
+      pending_rules:add(rule)
+   end
+   return resolve_rules_aux(target_rule, pending_rules, source)
+end
+
+
+local function flatten_sources(t, r, s, x)
+   s = s or {}
+   r = r or {}
+   x = x or {}
+   for k, v in pairs(t) do
+      if type(k) == "number" then
+         if type(v) == "table" then
+            if getmetatable(v) ~= nil and v.targets then
+               -- Assume this is a "Build" instance.
+               flatten_sources(v.vars, r, s, x)
+               flatten_sources(v.targets, r, s, x)
+            else
+               flatten_sources(v, r, s, x)
+            end
+         elseif s[v] then
+            error("duplicate source '" .. v .. "'", 4)
+         else
+            table.insert(r, v)
+            s[v] = true
+         end
+      else
+         if x[k] then
+            x[k] = x[k] .. " " .. v
+         else
+            x[k] = v
+         end
+      end
+   end
+   return r, x
+end
+
+
+local build = List:new()
+
+
+local Rule = Object:clone {
+   render_targets = template "# Targets: %{targets:, }\n";
+   render_sources = template "# Sources: %{sources:, }\n";
+   render_rule    = template "rule %{name}\n";
+   render_var     = template "  %{name} = %{value}\n";
+
+   __init = function (self, name, vars)
+      if not vars.description then
+         vars.description = name:upper() .. " ${out}"
+      end
+      self.targets = list_or(vars.targets, vars.target)
+      self.sources = list_or(vars.sources, vars.source)
+      vars.targets, vars.target = nil, nil
+      vars.sources, vars.source = nil, nil
+      self.name = name
+      self.vars = vars
+   end;
+
+   write = function (self, f)
+      if self.targets then
+         f:write(self:render_targets())
+      end
+      if self.sources then
+         f:write(self:render_sources())
+      end
+      f:write(self:render_rule())
+      for k, v in pairs(self.vars) do
+         f:write(self.render_var { name = k, value = v })
+      end
+      f:write("\n")
+   end;
+
+   source_matches = function (self, filename)
+      if not self.__source_match_patterns then
+         self.__source_match_patterns = map(self.sources, function (stem_pattern)
+            return globtopattern(string.gsub(stem_pattern, "%%", "*"))
+         end)
+      end
+      for _, pattern in ipairs(self.__source_match_patterns) do
+         if filename:match(pattern) then
+            return true
+         end
+      end
+      return false
+   end;
+
+   target_matches = function (self, filename)
+      if not self.__target_match_pattern then
+         self.__target_match_pattern = globtopattern(string.gsub(self.targets[1], "%%", "*", 1))
+      end
+      if filename:match(self.__target_match_pattern) then
+         return true
+      end
+      return false
+   end;
+
+   infer = function (self, target_stem, param)
+      local sources, vars = flatten_sources(param)
+      for var, value in pairs(vars) do
+         dprint("VAR: %s = %s\n", var, value)
+      end
+      local targets = map(self.targets, function (target_pattern)
+         return "${builddir}" .. dir_sep ..
+         (string.gsub(target_pattern, "%%", target_stem))
+      end)
+
+      local resolved, pending = Set:new(), Set:new()
+
+      dprint("Rule '%s', target '%s'\n", self.name, targets[1])
+      for _, source in ipairs(sources) do
+         if type(source) == "table" then
+            -- Assume it's a "Build" object.
+            for _, item in ipairs(source.targets) do
+               if self:source_matches(item) then
+                  resolved:add(item)
+               else
+                  pending:add(item)
+               end
+            end
+         else
+            if self:source_matches(source) then
+               resolved:add(source)
+            else
+               pending:add(source)
+            end
+         end
+      end
+
+      dprint("  Resolved %d: %s\n", resolved.n, resolved:concat(", "))
+      dprint("  Pending %d: %s\n", pending.n, pending:concat(", "))
+
+      while pending.n > 0 do
+         local source = pending:any()
+         dprint("  Resolving %q\n", source)
+         local ok, target, buildrules = resolve_rules(self, source)
+         if ok then
+            pending:remove(source)
+            resolved:add(target)
+            dprint("    Build:\n")
+            for _, b in buildrules:ipairs() do
+               b:add_vars(vars)
+               build:append(b)
+               dprint("      %s : %s %s\n", b.targets[1], b.rule, table.concat(b.sources, " "))
+            end
+         else
+            error("Cannot resolve: " .. source)
+         end
+      end
+
+      local b = Build:new(self, { targets = targets, sources = resolved:as_table() })
+      b:add_vars(vars)
+      build:append(b)
+      dprint("  %s : %s %s\n", b.targets[1], b.rule, table.concat(b.sources or {}, " "))
+      return b
+   end;
+
+   _targets_for = function (self, filename)
+      local n, targets = 0, {}
+      for i, stem_pattern in ipairs(self.sources) do
+         stem_pattern = stem_pattern:gsub("%*", "%%", 1)
+         local pattern = "^" .. (stem_pattern:gsub("%%", "(.*)", 1)) .. "$"
+         local stem = filename:match(pattern)
+         if stem then
+            for _, target_pattern in ipairs(self.targets) do
+               local target = target_pattern:gsub("%%", stem, 1)
+               n = n + 1
+               targets[n] = target
+            end
+         end
+      end
+      return targets
+   end;
+}
+
+
+local Variable = Object:clone {
+   render = template "%{name} = %{value: }\n";
+
+   __init = function (self, name, value)
+      self.name = name
+      self.value = type(value) == "table" and value or { value }
+   end;
+   write = function (self, f)
+      f:write(self:render())
+   end;
+}
+
+local VariableAppend = Variable:clone {
+   render = template "%{name} = ${%{name}} %{value: }\n";
+}
+
+local VariablePrepend = Variable:clone {
+   render = template "%{name} = %{value: } ${%{name}}\n";
+}
+
+local VariableUnset = Variable:clone {
+   render = template "%{name} =\n";
+}
+
+
+local vars = List:new()
+
+local build_meta = {
+   --
+   -- Each rule has a __call metamethod. If a rule named "lib" exists, this
+   -- allows for the following syntax:
+   --
+   --   	build.lib "foo" { ... }
+   --
+   __index = function (_, key)
+      local rule = rules[key]
+      if rule then
+         return function (target_stem)
+            return function (...)
+               return rule:infer(target_stem, ...)
+            end
+         end
+      end
+   end;
+
+   --
+   -- This allows for directly creating a rule by allowing the following
+   -- syntax:
+   --
+   -- 		build "rulename" { ... }
+   --
+   __call = function (rule)
+      return function (param)
+         build:append(Build:new(rule, param))
+      end
+   end;
+}
+
+
+local environ_meta = {
+   __index = function (_, key)
+      return os.getenv(key)
+   end
+}
+
+
+local ctx_globals = {
+   build = setmetatable({}, build_meta);
+   environ = setmetatable({}, environ_meta);
+
+   pairs = pairs;
+   ipairs = ipairs;
+
+   rule = function (name)
+      if rules[name] then
+         error("Rule '" .. name .. "' was already defined", 2)
+      end
+      return function (param)
+         local r = Rule:new(name, param)
+         rules[r.name] = r
+      end
+   end;
+
+   set = function (name, value)
+      if value == nil then
+         return function (value)
+            vars:append(Variable:new(name, value or ""))
+         end
+      else
+         vars:append(Variable:new(name, value or ""))
+      end
+   end;
+
+   append = function (name, value)
+      if value == nil then
+         return function (value)
+            vars:append(VariableAppend:new(name, value or ""))
+         end
+      else
+         vars:append(VariableAppend:new(name, value or ""))
+      end
+   end;
+
+   prepend = function (name, value)
+      if value == nil then
+         return function (value)
+            vars:append(VariablePrepend:new(name, value or ""))
+         end
+      else
+         vars:append(VariablePrepend:new(name, value or ""))
+      end
+   end;
+
+   unset = function (name)
+      vars:append(VariableUnset:new(name))
+   end;
+
+   print = function (...)
+      io.stderr:write("Build:")
+      for i = 1, select("#", ...) do
+         local value = select(i, ...)
+         if type(value) == "table" and value.__repr then
+            value = value:__repr()
+         else
+            value = tostring(value)
+         end
+         io.stderr:write(" ", value)
+      end
+      io.stderr:write("\n")
+   end;
+
+   info = function (vars)
+      return function (format)
+         io.stderr:write(interpolate(format, vars))
+      end
+   end;
+
+   error = function (arg)
+      if type(arg) == "table" then
+         return function (format)
+            error(interpolate(format, arg), 2)
+         end
+      else
+         error(arg, 2)
+      end
+   end;
+
+   help = function (help_text)
+      if OPTIONS["-h"] or OPTIONS["--help"] then
+         io.stderr:write(help_text)
+         os.exit(0)
+      end
+   end;
+
+   glob = function (locations)
+      locations = list_or(locations, locations)
+      return function (globs)
+         globs = list_or(globs, globs)
+         local files = List:new()
+         for _, path in ipairs(locations) do
+            for _, glob in ipairs(globs) do
+               local pattern = globtopattern(glob)
+               dprint("path: %q, pattern: %q\n", path, pattern)
+               for name, kind in ls_dir(path) do
+                  if kind == "file" and name:sub(1, 1) ~= "." and name:match(pattern) then
+                     dprint(" * %q\n", name)
+                     files:append(path .. dir_sep .. name)
+                  end
+               end
+            end
+         end
+         return files
+      end
+   end;
+}
+
+
+local function load_build(path)
+   local ctx_vars = setmetatable({ options = OPTIONS }, { __index = ctx_globals })
+   local chunk, err = loadfile(path, "t", ctx_vars)
+   if not chunk then
+      io.stderr:write(err, "\n")
+      os.exit(1)
+   end
+   local ok, err = pcall(chunk)
+   if not ok then
+      io.stderr:write(err, "\n")
+      os.exit(2)
+   end
+   return ctx_vars
+end
+
+
+local context_meta = {
+   __index = function (ctx, key)
+      local factory = factories[key]
+      if factory == nil then
+         error("No such factory: " .. key, 2)
+      end
+      return factory(ctx, key)
+   end;
+}
+
+
+local function write_output(f)
+   for _, var in ipairs(vars) do
+      var:write(f)
+   end
+   f:write("\n")
+   for _, rule in pairs(rules) do
+      rule:write(f)
+   end
+   for _, bld in ipairs(build) do
+      bld:write(f)
+   end
+end
+
+-- Always set a "builddir" variable.
+vars:append(Variable:new("builddir", OPTIONS.builddir or "build"))
+
+local rr = load_build("Build")
+
+local f, err = io.open("build.ninja", "wb")
+if not f then
+   io.stderr:write("Cannot open 'build.ninja': " .. err)
+   os.exit(4)
+end
+write_output(f)

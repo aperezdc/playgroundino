@@ -1,0 +1,155 @@
+-- vim:set ft=lua ts=3 sw=3 et tw=90:
+
+help [[
+Options:
+   --with-hardware=PATH    Set path to directory containing boards.txt
+   --help                  Show this help message.
+]]
+
+--
+-- TODO: Parse boards.txt and friends
+--
+local toolchains = {
+   avr = {
+      ar        = "avr-ar";
+      ld        = "avr-gcc";
+      cc        = "avr-gcc";
+      cxx       = "avr-g++";
+      objcopy   = "avr-objcopy";
+      cppflags  = "-DF_CPU=${mcu-mhz}000000L";
+      ldflags   = "-g -Os -flto -fuse-linker-plugin -Wl,--gc-sections -L${builddir} -lm";
+      cflags    = "-std=gnu11";
+      cxxflags  = "-std=gnu++14 -fpermissive -fno-exceptions"
+               .. " -fno-threadsafe-statics -fno-devirtualize"
+               .. " -fno-use-cxa-atexit";
+      ccxxflags = "-g -Os -mmcu=${mcu} -flto -fno-fat-lto-objects"
+               .. " -ffunction-sections -fdata-sections -funsigned-char"
+               .. " -funsigned-bitfields -fpack-struct -fshort-enums";
+   };
+}
+
+local targets = {
+   arduino = {
+      toolchain = "avr";
+      board = "AVR_UNO";
+      variant = "standard";
+      mcu = "atmega328p";
+      mhz = 8;
+   };
+}
+
+targets.metro328 = targets.arduino
+
+if not options["--with-hardware"] then
+   error("Option '--with-hardware=PATH' not specified")
+end
+local arduino_path = options["--with-hardware"]
+
+if not options.target then
+   options.target = "arduino"
+end
+if not options.mcu then
+   options.mcu = targets[options.target].mcu
+end
+if not options.toolchain then
+   options.toolchain = targets[options.target].toolchain
+end
+if not options.mhz then
+   options.mhz = targets[options.target].mhz
+end
+
+local target = targets[options.target]
+
+info { options = options, target = target } [[
+Target: %{options.target} %{target.variant} %{target.board}
+   MCU: %{options.mcu} @%{options.mhz}MHz
+]]
+
+set "mcu"     (options.mcu)
+set "mcu-mhz" (options.mhz)
+for var, value in pairs(toolchains[options.toolchain]) do
+   set ("tc-" .. var) (value)
+end
+
+-- Import variables from the environment.
+for _, var in ipairs { "cppflags", "cflags", "cxxflags" } do
+   set (var) (environ[var:upper()])
+end
+
+append "cppflags" ("-DARDUINO_" .. target.board)
+append "cppflags" ("-I" .. arduino_path .. "/cores/arduino")
+append "cppflags" ("-I" .. arduino_path .. "/variants/" .. target.variant)
+
+
+rule "cxx" {
+   deps = "gcc";
+   depfile = "${out}.d";
+   command = "${tc-cxx} ${tc-cppflags} ${cppflags} ${tc-ccxxflags} ${tcp-cxxflags} ${cxxflags} -MMD -MF ${out}.d -c -o ${out} ${in}";
+   sources = { "%.cc", "%.cpp" };
+   target = "%.o";
+}
+
+rule "cc" {
+   deps = "gcc";
+   depfile = "${out}.d";
+   command = "${tc-cc} ${tc-cppflags} ${cppflags} ${tc-ccxxflags} ${tc-cflags} ${cflags} -MMD -MF ${out}.d -c -o ${out} ${in}";
+   source = "%.c";
+   target = "%.o";
+}
+
+rule "lib" {
+   command = "${tc-ar} rcsu ${out} ${in}";
+   source = "*.o";
+   target = "lib%.a";
+}
+
+rule "elf" {
+   command = "${tc-ld} ${tc-ldflags} ${ldflags} -o ${out} ${in}";
+   sources = { "*.o", "*.a" };
+   target = "%.elf";
+}
+
+rule "hex" {
+   command = "${tc-objcopy} -O ihex -R .eeprom ${in} ${out}";
+   source = "%.elf";
+   target = "%.hex";
+}
+
+rule "eep" {
+   command = "${tc-objcopy} -O ihex -j .eeprom --set-section-flags=.eeprom=alloc,load"
+          .. " --no-change-warnings --change-section-lma .eeprom=0 ${in} ${out}";
+   source = "%.elf";
+   target = "%.eep";
+}
+
+arduino_path = "/usr/share/arduino/hardware/archlinux-arduino"
+
+libarduino = build.lib "arduino" {
+   glob { arduino_path .. "/avr/cores/arduino" } { "*.cpp", "*.cc", "*.c" };
+}
+
+function sketch(name)
+   return function (sources)
+      local elf = build.elf (name) { libarduino, sources }
+      local hex = build.hex (name) { elf }
+      local eep = build.eep (name) { elf }
+      return hex, eep, elf
+   end
+end
+
+function library(name)
+   local srcdir = arduino_path .. "/avr/libraries/" .. name .. "/src"
+   return build.lib (name) {
+      glob { srcdir } { "*.cpp", "*.cc", "*.c" };
+      cppflags = "-I" .. srcdir;
+   }
+end
+
+libEEPROM = library "EEPROM"
+libHID = library "HID"
+libSPI = library "SPI"
+libWire = library "Wire"
+libSoftwareSerial = library "SoftwareSerial"
+
+sketch "eeprom-clear" { "eeprom/clear.cc", libEEPROM }
+sketch "blinky" { "blinky/blinky.cc" }
