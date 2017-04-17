@@ -34,7 +34,7 @@ local targets = {
       board = "AVR_UNO";
       variant = "standard";
       mcu = "atmega328p";
-      mhz = 8;
+      mhz = 16;
    };
 }
 
