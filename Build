@@ -17,7 +17,7 @@ local toolchains = {
       cxx       = "avr-g++";
       objcopy   = "avr-objcopy";
       cppflags  = "-DF_CPU=${mcu-mhz}000000L";
-      ldflags   = "-g -Os -flto -fuse-linker-plugin -Wl,--gc-sections -L${builddir} -lm";
+      ldflags   = "-g -Os -mmcu=${mcu} -flto -fuse-linker-plugin -Wl,--gc-sections -lm";
       cflags    = "-std=gnu11";
       cxxflags  = "-std=gnu++14 -fpermissive -fno-exceptions"
                .. " -fno-threadsafe-statics -fno-devirtualize"
