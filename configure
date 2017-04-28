@@ -400,83 +400,73 @@ end
 
 
 local List = Object:clone {
-   __init = function (self)
-      self.n = 0
-   end;
-   append = function (self, item)
-      self.n = self.n + 1
-      self[self.n] = item
-   end;
-   pop_left = function (self)
-      assert(self.n > 0)
-      return self:remove(1)
-   end;
-   pop_right = function (self)
-      assert(self.n > 0)
-      return self:remove(self.n)
-   end;
-   insert = table.insert;
-   concat = table.concat;
-   remove = table.remove;
-   ipairs = ipairs;
-}
-
-
-local Set = Object:clone {
-   __init = function (self, ...)
-      self._items = {}
-      self.n = 0
-      for i = 1, select("#", ...) do
-         self:add(select(i, ...))
+   __init = function (self, duplicates)
+      if type(duplicates) == "function" then
+         self._on_duplicate = duplicates
+      else
+         self._on_duplicate = type(duplicates) == "boolean" and duplicates
       end
+      if self._on_duplicate then
+         self._positions = {}
+      end
+      self.n = 0
    end;
-   contains = function (self, item)
-      return self._items[item] == true
-   end;
-   add = function (self, item)
-      if self._items[item] ~= true then
-         self._items[item] = true
+
+   append = function (self, item)
+      if self._on_duplicate then
+         local position = self._positions[item]
+         if position ~= nil then
+            -- If the callback returns falsey, do not move the item.
+            if not self:_on_duplicate(position, item) then
+               return
+            end
+            table.remove(self, position)
+         else
+            self.n = self.n + 1
+         end
+         self._positions[item] = n
+      else
          self.n = self.n + 1
       end
+      self[self.n] = item
    end;
+
    remove = function (self, item)
-      if self._items[item] == true then
-         self._items[item] = nil
+      assert(self._on_duplicate)
+      local position = self._positions[item]
+      if position ~= nil then
+         table.remove(self, position)
+         self._positions[item] = nil
          self.n = self.n - 1
       end
    end;
+
    items = function (self)
       return coroutine.wrap(function ()
-         for k, _ in pairs(self._items) do
-            coroutine.yield(k)
+         for _, item in ipairs(self) do
+            coroutine.yield(item)
          end
       end)
    end;
-   concat = function (self, str)
-      return table.concat(self:as_table(), str)
-   end;
-   any = function (self)
-      assert(self.n > 0)
-      for k, _ in pairs(self._items) do
-         return k
-      end
-   end;
+
    copy = function (self)
-      local new_set = self:prototype():new()
-      for item, _ in pairs(self._items) do
-         new_set:add(item)
+      local result = self:prototype():new(self._on_duplicate)
+      for _, item in ipairs(self) do
+         result:append(item)
       end
-      return new_set
+      return result
    end;
-   as_table = function (self)
-      local n, t = 0, {}
-      for k, _ in pairs(self._items) do
-         n = n + 1
-         t[n] = k
-      end
-      return t
-   end;
+
+   concat = table.concat;
+   ipairs = ipairs;
+
 }
+
+local Set = true
+local function WarningSet(list, position, item)
+   io.stderr:write("warning: target '", item, "' redefined.\n")
+   return true
+end
 
 
 local function list_or(list, item, default)
@@ -511,7 +501,7 @@ local Build = Object:clone {
    end;
 
    __repr = function (self)
-      local vars = List:new()
+      local vars = List:new(WarningSet)
       for key, value in pairs(self.vars) do
          vars:append(self.render_repr_var { name = key, value = value })
       end
@@ -556,6 +546,8 @@ local Build = Object:clone {
 
 
 local rules = {}
+local build = List:new(WarningSet)
+
 
 local function resolve_rules_aux(t_rule, pending_rules, source)
    for rule in pending_rules:items() do
@@ -564,7 +556,7 @@ local function resolve_rules_aux(t_rule, pending_rules, source)
          -- dprint("(??) %s : %s %s\n", target, rule.name, source)
          if t_rule:source_matches(target) then
             -- dprint("  --> OK\n")
-            local build_chain = List:new()
+            local build_chain = List:new(Set)
             build_chain:append(Build:new(rule, {
                source = source;
                target = target;
@@ -588,11 +580,26 @@ local function resolve_rules_aux(t_rule, pending_rules, source)
 end
 
 local function resolve_rules(target_rule, source)
-   local pending_rules = Set:new()
+   local pending_rules = List:new(Set)
    for _, rule in pairs(rules) do
-      pending_rules:add(rule)
+      pending_rules:append(rule)
    end
    return resolve_rules_aux(target_rule, pending_rules, source)
+end
+
+local function resolve_one(target_rule, source, vars)
+   dprint("  Resolving %q\n", source)
+   local ok, target, buildrules = resolve_rules(target_rule, source)
+   if ok then
+      for _, b in buildrules:ipairs() do
+         dprint("    %s : %s %s\n", b.targets[1], b.rule, table.concat(b.sources, " "))
+         b:add_vars(vars)
+         build:append(b)
+      end
+      return target
+   else
+      error("Canno resolve: " .. source)
+   end
 end
 
 
@@ -626,9 +633,6 @@ local function flatten_sources(t, r, s, x)
    end
    return r, x
 end
-
-
-local build = List:new()
 
 
 local Rule = Object:clone {
@@ -700,7 +704,7 @@ local Rule = Object:clone {
          (string.gsub(target_pattern, "%%", target_stem))
       end)
 
-      local resolved, pending = Set:new(), Set:new()
+      local resolved = List:new(WarningSet)
 
       dprint("Rule '%s', target '%s'\n", self.name, targets[1])
       for _, source in ipairs(sources) do
@@ -708,42 +712,21 @@ local Rule = Object:clone {
             -- Assume it's a "Build" object.
             for _, item in ipairs(source.targets) do
                if self:source_matches(item) then
-                  resolved:add(item)
+                  resolved:append(item)
                else
-                  pending:add(item)
+                  resolved:append(resolve_one(self, item, vars))
                end
             end
          else
             if self:source_matches(source) then
-               resolved:add(source)
+               resolved:append(source)
             else
-               pending:add(source)
+               resolved:append(resolve_one(self, source, vars))
             end
          end
       end
 
-      dprint("  Resolved %d: %s\n", resolved.n, resolved:concat(", "))
-      dprint("  Pending %d: %s\n", pending.n, pending:concat(", "))
-
-      while pending.n > 0 do
-         local source = pending:any()
-         dprint("  Resolving %q\n", source)
-         local ok, target, buildrules = resolve_rules(self, source)
-         if ok then
-            pending:remove(source)
-            resolved:add(target)
-            dprint("    Build:\n")
-            for _, b in buildrules:ipairs() do
-               b:add_vars(vars)
-               build:append(b)
-               dprint("      %s : %s %s\n", b.targets[1], b.rule, table.concat(b.sources, " "))
-            end
-         else
-            error("Cannot resolve: " .. source)
-         end
-      end
-
-      local b = Build:new(self, { targets = targets, sources = resolved:as_table() })
+      local b = Build:new(self, { targets = targets, sources = resolved })
       b:add_vars(vars)
       build:append(b)
       dprint("  %s : %s %s\n", b.targets[1], b.rule, table.concat(b.sources or {}, " "))
