@@ -174,6 +174,7 @@ libRTC = build.lib "RTC" {
 
 sketch "eeprom-clear" { "eeprom/clear.cc", libEEPROM }
 
+sketch "i2c-rtc" { "i2c/rtc.cc", libRTC, libWire }
 sketch "i2c-scan" { "i2c/scan.cc", libWire }
 
 sketch "blinky" { "blinky/blinky.cc" }
