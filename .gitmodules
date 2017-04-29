@@ -1,0 +1,3 @@
+[submodule "thirdparty/RTClib"]
+	path = thirdparty/RTClib
+	url = https://github.com/adafruit/RTClib

@@ -151,6 +151,12 @@ libSPI = library "SPI"
 libWire = library "Wire"
 libSoftwareSerial = library "SoftwareSerial"
 
+-- Third-party libraries
+libRTC = build.lib "RTC" {
+   glob { "thirdparty/RTClib" } { "*.cpp", "*.cc", "*.c" };
+   cppflags = libWire.vars.cppflags .. " -Ithirdparty/RTClib";
+}
+
 sketch "eeprom-clear" { "eeprom/clear.cc", libEEPROM }
 
 sketch "blinky" { "blinky/blinky.cc" }
