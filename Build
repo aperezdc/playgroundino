@@ -35,6 +35,9 @@ local targets = {
       variant = "standard";
       mcu = "atmega328p";
       mhz = 16;
+      vars = {
+         cppflags = "-DARDUINO=182";
+      };
    };
 }
 
@@ -79,6 +82,11 @@ end
 append "cppflags" ("-DARDUINO_" .. target.board)
 append "cppflags" ("-I" .. arduino_path .. "/cores/arduino")
 append "cppflags" ("-I" .. arduino_path .. "/variants/" .. target.variant)
+
+-- Add target-specific values to variables.
+for var, value in pairs(target.vars or {}) do
+   append (var) (value)
+end
 
 
 rule "cxx" {
