@@ -154,3 +154,4 @@ libSoftwareSerial = library "SoftwareSerial"
 sketch "eeprom-clear" { "eeprom/clear.cc", libEEPROM }
 sketch "blinky" { "blinky/blinky.cc" }
 sketch "pwmfade" { "blinky/pwmfade.cc" }
+sketch "rgbfade" { "blinky/rgbfade.cc" }
