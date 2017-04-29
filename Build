@@ -156,7 +156,14 @@ end
 libEEPROM = library "EEPROM"
 libHID = library "HID"
 libSPI = library "SPI"
-libWire = library "Wire"
+-- libWire = library "Wire"
+libWire = build.lib "Wire" {
+   glob {
+      arduino_path .. "/avr/libraries/Wire/src";
+      arduino_path .. "/avr/libraries/Wire/src/utility";
+   } { "*.cpp", "*cc", "*.c" };
+   cppflags = "-I" .. arduino_path .. "/avr/libraries/Wire/src";
+}
 libSoftwareSerial = library "SoftwareSerial"
 
 -- Third-party libraries
