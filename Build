@@ -183,3 +183,4 @@ sketch "pwmfade" { "blinky/pwmfade.cc" }
 sketch "rgbfade" { "blinky/rgbfade.cc" }
 
 sketch "s7777-test" { "s7777/test.cc" }
+sketch "s7777-clock" { "s7777/clock.cc", libRTC, libWire }

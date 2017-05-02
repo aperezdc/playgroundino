@@ -32,6 +32,11 @@ namespace s7777 {
     };
 #undef B16
 
+enum Format {
+    Decimal,
+    Hex,
+};
+
 constexpr static uint16_t c(int ch)
 {
     switch (ch) {
@@ -88,7 +93,6 @@ template <uint8_t SDataPin,
 class Controller {
 private:
     uint16_t m_digits[4] = { 0, 0, 0, 0 };
-    uint8_t  m_current = 0;
 
 public:
 
@@ -97,12 +101,14 @@ public:
         pinMode(LatchPin, OUTPUT);
         pinMode(ClockPin, OUTPUT);
         clear();
+        refresh();
     }
 
     inline void clear() {
-        for (uint8_t i = 0; i < 4; i++)
-            m_digits[i] = 0;
-        refresh();
+        m_digits[0] = 0;
+        m_digits[1] = 0;
+        m_digits[2] = 0;
+        m_digits[3] = 0;
     }
 
     void display(uint16_t d1, uint16_t d2, uint16_t d3, uint16_t d4, bool colon = false) {
@@ -110,6 +116,31 @@ public:
         m_digits[1] = D2 | (MASK & d2) | (colon ? CC : 0);
         m_digits[2] = D3 | (MASK & d3) | (colon ? CC : 0);
         m_digits[3] = D4 | (MASK & d4) | (colon ? CC : 0);
+    }
+
+    void display(uint8_t hi, uint8_t lo, Format fmt = Decimal) {
+        switch (fmt) {
+            case Decimal:
+                display_decimal(hi, lo);
+                break;
+            case Hex:
+                display_hex(hi, lo);
+                break;
+        }
+    }
+
+    void colon(bool enabled = true) {
+        if (enabled) {
+            m_digits[0] |= CC;
+            m_digits[1] |= CC;
+            m_digits[2] |= CC;
+            m_digits[3] |= CC;
+        } else {
+            m_digits[0] &= ~CC;
+            m_digits[1] &= ~CC;
+            m_digits[2] &= ~CC;
+            m_digits[3] &= ~CC;
+        }
     }
 
     void display(const char* text) {
@@ -127,12 +158,38 @@ public:
     }
 
     void refresh() {
-        write(m_digits[m_current++]);
-        m_current %= 4;
+        write(m_digits[0]);
+        write(m_digits[1]);
+        write(m_digits[2]);
+        write(m_digits[3]);
     }
 
 private:
-    void write(uint16_t bits) const {
+    inline void display_decimal(uint8_t hi, uint8_t lo) {
+        if (hi > 99) {
+            m_digits[0] = D1 | c('E');
+            m_digits[1] = D2 | c('E');
+        } else {
+            m_digits[0] = D1 | c(hi / 10);
+            m_digits[1] = D2 | c(hi % 10);
+        }
+        if (lo > 99) {
+            m_digits[2] = D3 | c('E');
+            m_digits[3] = D4 | c('E');
+        } else {
+            m_digits[2] = D3 | c(lo / 10);
+            m_digits[3] = D4 | c(lo % 10);
+        }
+    }
+
+    inline void display_hex(uint8_t hi, uint8_t lo) {
+        m_digits[0] = D1 | c(hi >> 4);
+        m_digits[1] = D2 | c(hi & 0xF);
+        m_digits[2] = D3 | c(lo >> 4);
+        m_digits[3] = D4 | c(lo & 0xF);
+    }
+
+    inline void write(uint16_t bits) const {
         digitalWrite(LatchPin, LOW);
         shiftOut(SDataPin, ClockPin, MSBFIRST,
                  static_cast<uint8_t>(bits >> 8));
