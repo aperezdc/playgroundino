@@ -83,6 +83,7 @@ constexpr static uint16_t c(int ch)
         case ',': return C;
         case ':': return CC;
         case ' ': return 0;
+        default: return 0;
     }
 }
 
