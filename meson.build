@@ -17,6 +17,8 @@ add_project_arguments([
   '-DF_CPU=@0@000000L'.format(mhz),
 ], language: ['c', 'cpp'])
 
+tc_objcopy = find_program('objcopy', required: true)
+
 ##
 ## libArduino
 ##
@@ -145,35 +147,40 @@ libRTC_dep = declare_dependency(
   dependencies: libBusIO_dep,
 )
 
+all_exe = []
+
 ##
 ## eeprom-clear
 ##
-eeprom_clear_exe = executable('eeprom-clear',
-  'eeprom' / 'clear.cc',
-  dependencies: libEEPROM_dep,
-  install: false,
-)
+all_exe += [
+  executable('eeprom-clear',
+    'eeprom' / 'clear.cc',
+    dependencies: libEEPROM_dep,
+    install: false,
+  ),
+]
 
 ##
 ## i2c
 ##
-i2c_scan_exe = executable('i2c-scan',
-  'i2c' / 'scan.cc',
-  dependencies: libWire_dep,
-  install: false,
-)
-i2c_rtc_exe = executable('i2c-rtc',
-  'i2c' / 'rtc.cc',
-  dependencies: libRTC_dep,
-  install: false,
-)
+all_exe += [
+  executable('i2c-scan',
+    'i2c' / 'scan.cc',
+    dependencies: libWire_dep,
+    install: false,
+  ),
+  executable('i2c-rtc',
+    'i2c' / 'rtc.cc',
+    dependencies: libRTC_dep,
+    install: false,
+  ),
+]
 
 ##
 ## blinky
 ##
-blinky_exe = []
 foreach item : ['blinky', 'knight', 'pwmfade', 'rgbfade']
-  blinky_exe += [
+  all_exe += [
     executable(item,
       'blinky' / '@0@.cc'.format(item),
       dependencies: libArduino_dep, install: false,
@@ -184,13 +191,39 @@ endforeach
 ##
 ## s7777
 ##
-s7777_test_exe = executable('s7777-test',
-  's7777' / 'test.cc',
-  dependencies: libArduino_dep,
-  install: false,
-)
-s7777_clock_exe = executable('s7777-clock',
-  's7777' / 'clock.cc',
-  dependencies: libRTC_dep,
-  install: false,
-)
+all_exe += [
+  executable('s7777-test',
+    's7777' / 'test.cc',
+    dependencies: libArduino_dep,
+    install: false,
+  ),
+  executable('s7777-clock',
+    's7777' / 'clock.cc',
+    dependencies: libRTC_dep,
+    install: false,
+  ),
+]
+
+##
+## Produce .hex + .eep outputs
+##
+foreach item : all_exe
+  custom_target('@0@.hex'.format(item.name()),
+    output: '@0@.hex'.format(item.name()),
+    input: item,
+    command: [tc_objcopy, '-O', 'ihex', '-R', '.eeprom=0', '@INPUT@', '@OUTPUT@'],
+    build_by_default: true,
+    install: false,
+  )
+  custom_target('@0@.eep'.format(item.name()),
+    output: '@0@.eep'.format(item.name()),
+    input: item,
+    command: [tc_objcopy, '-O', 'ihex', '-j', '.eeprom',
+      '--set-section-flags=.eeprom=alloc,load',
+      '--no-change-warnings', '--change-section-lma', '.eeprom=0',
+      '@INPUT@', '@OUTPUT@'
+    ],
+    build_by_default: true,
+    install: false,
+  )
+endforeach
