@@ -1,3 +1,6 @@
 [submodule "thirdparty/RTClib"]
 	path = thirdparty/RTClib
 	url = https://github.com/adafruit/RTClib
+[submodule "thirdparty/BusIO"]
+	path = thirdparty/BusIO
+	url = https://github.com/adafruit/Adafruit_BusIO.git
